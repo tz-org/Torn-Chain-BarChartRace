@@ -325,5 +325,14 @@ git push origin v0.0.1
 3. 生成 `SHA256SUMS.txt`；
 4. 用 `GITHUB_TOKEN` 创建 Release 并上传全部产物，Release notes 由 `--generate-notes` 依据提交历史自动生成。
 
+构建带 `-buildvcs=false`。这是刻意的：默认会把 `vcs.revision`、`vcs.time` 和模块伪版本编进二进制，
+导致同一份源码在不同 checkout 下产出不同哈希，`SHA256SUMS.txt` 便失去可验证性。
+关掉之后，本地用同样参数重建可以逐字节复现发布产物：
+
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOFLAGS=-trimpath \
+  go build -buildvcs=false -ldflags "-s -w -X main.version=0.0.1" .
+```
+
 对已存在的 tag 需要重跑时，可在 Actions 页面用 **Run workflow** 手工触发并填入 tag 名；
 若 Release 已存在，会走 `gh release upload --clobber` 覆盖资产而不是报错。
