@@ -7,16 +7,28 @@ import (
 	"path/filepath"
 )
 
+// ConfigDirName 是存放本地配置的目录名，位于**当前工作目录**下。
+//
+// 选择当前目录而不是 os.UserConfigDir()，是为了让工具「跟着项目走」：
+// 把整个目录拷走就能连配置一起带走，多份数据各自独立互不干扰。
+const ConfigDirName = ".chainrace"
+
+// ConfigFileName 是配置文件名。
+const ConfigFileName = "config.json"
+
 // Config 是跨运行持久化的用户设置。
 //
 // 只存「每次都要重填会很烦」的东西，不存任何可推导的派生值。
 type Config struct {
-	// APIKey 以明文保存在用户配置目录，权限 0600。
+	// APIKey 以明文保存在 ./.chainrace/config.json，权限 0600。
 	//
 	// 取舍说明：这是一个本地单人工具，把 key 加密再存只是把密钥换个地方放，
 	// 并不能真正提升安全性；真正有效的做法是「不落盘」——
 	// 因此环境变量 TORN_API_KEY 与 -api 参数的优先级都高于这里，
 	// 且 -no-save 可以完全关掉持久化。
+	//
+	// 注意：该目录已写入 .gitignore。**不要**把它移出忽略列表，
+	// 否则 key 会被提交进仓库历史。
 	APIKey string `json:"api_key,omitempty"`
 	// IntervalSec 是默认统计间隔（秒）。
 	IntervalSec int `json:"interval_sec,omitempty"`
@@ -28,13 +40,13 @@ type Config struct {
 	OutDir string `json:"out_dir,omitempty"`
 }
 
-// ConfigPath 返回配置文件的绝对路径。
+// ConfigPath 返回配置文件的绝对路径：<当前工作目录>/.chainrace/config.json
 func ConfigPath() (string, error) {
-	dir, err := os.UserConfigDir()
+	wd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("无法定位用户配置目录: %w", err)
+		return "", fmt.Errorf("无法定位当前工作目录: %w", err)
 	}
-	return filepath.Join(dir, "torn-chain-race", "config.json"), nil
+	return filepath.Join(wd, ConfigDirName, ConfigFileName), nil
 }
 
 // LoadConfig 读取配置。文件不存在不是错误 —— 返回空配置即可。

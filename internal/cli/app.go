@@ -75,7 +75,7 @@ func Run(ctx context.Context, opt Options, in io.Reader, out io.Writer) error {
 		if err := SaveConfig(cfg); err != nil {
 			fmt.Fprintf(out, "⚠️ 保存配置失败（下次仍需重新输入）：%v\n", err)
 		} else if path, perr := ConfigPath(); perr == nil {
-			fmt.Fprintf(out, "  ✓ 已记住该 key（%s，权限 0600；用 -no-save 可关闭）\n", path)
+			fmt.Fprintf(out, "  ✓ 已记住该 key（%s，仅当前用户可读；用 -no-save 可关闭）\n", path)
 		}
 	}
 	fmt.Fprintf(out, "  key %s · 来源：%s\n", MaskKey(key), keySource)

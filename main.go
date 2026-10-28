@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,7 +72,10 @@ func run() error {
 	flag.BoolVar(&showVersion, "version", false, "打印版本号后退出")
 
 	flag.Usage = usage
-	flag.Parse()
+	// Go 的 flag 包遇到第一个非 flag 参数就停止解析，
+	// 于是 `chainrace 1234567 -offline` 会静默忽略 -offline —— 而 chain id 前置
+	// 正是 README 推荐写法。先重排再解析，两种顺序都能生效。
+	_ = flag.CommandLine.Parse(reorderArgs(flag.CommandLine, os.Args[1:]))
 
 	if showVersion {
 		fmt.Printf("chainrace %s\n", version)
@@ -116,6 +120,53 @@ func run() error {
 		AssumeYes:    yes,
 	}
 	return cli.Run(ctx, opt, os.Stdin, os.Stdout)
+}
+
+// reorderArgs 把 argv 重排成「所有 flag 在前、位置参数在后」。
+//
+// 动机：flag 包在遇到第一个非 flag 参数时停止解析，所以
+// `chainrace 1234567 -offline` 会把 -offline 当成位置参数静默丢弃 ——
+// 既不报错也不生效，属于最难察觉的一类缺陷。
+func reorderArgs(fs *flag.FlagSet, argv []string) []string {
+	flags := make([]string, 0, len(argv))
+	positional := make([]string, 0, 1)
+
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			// 显式分隔符之后的一律是位置参数。
+			positional = append(positional, argv[i+1:]...)
+			break
+		}
+		// 只有 "-x" / "--x" 才算 flag；单独的 "-" 是位置参数。
+		if len(a) < 2 || a[0] != '-' {
+			positional = append(positional, a)
+			continue
+		}
+		flags = append(flags, a)
+
+		name := strings.TrimLeft(a, "-")
+		if strings.Contains(name, "=") || isBoolFlag(fs, name) {
+			continue
+		}
+		// 分离式取值（-api KEY）：下一项是它的值，必须一并前移，
+		// 否则重排后会变成两个互不相干的位置参数。
+		if i+1 < len(argv) {
+			i++
+			flags = append(flags, argv[i])
+		}
+	}
+	return append(flags, positional...)
+}
+
+// isBoolFlag 判断某个已注册的 flag 是否为布尔型 —— 布尔型不消费下一个参数。
+func isBoolFlag(fs *flag.FlagSet, name string) bool {
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && bf.IsBoolFlag()
 }
 
 func usage() {

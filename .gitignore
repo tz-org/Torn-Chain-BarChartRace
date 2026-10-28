@@ -16,6 +16,10 @@ __debug_bin*
 /cmd/chainrace/chainrace
 
 # ===================== 运行期数据 =====================
+# .chainrace/ 里存的是 config.json —— 内含**明文 API key**。
+# 这一行是密钥不入库的唯一屏障，不要删除。
+.chainrace/
+
 # 缓存里是真实 chain 的完整 API 响应（含帮派成员 id、攻击记录），
 # 属于玩家数据而非源码，绝不入库。
 .chainrace-cache/
@@ -26,6 +30,8 @@ out/
 # ===================== 本地临时文件 =====================
 # .scratch 用于放接口规格、探针脚本等本地资料。
 .scratch/
+# 本地助手的工作区笔记，与项目源码无关。
+.workbuddy-ai/
 *.tmp
 *.log
 

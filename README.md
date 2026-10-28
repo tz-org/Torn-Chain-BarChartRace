@@ -45,7 +45,10 @@ go build -o chainrace .
 ```
 
 会依次询问：API key（输入不回显）→ chain id → 统计间隔 → 指标。
-key 校验通过后会被记住（存于用户配置目录，权限 0600），下次不必重输。
+key 校验通过后会被记住，存于**当前工作目录**下的 `.chainrace/config.json`，下次不必重输。
+
+> **该文件内含明文 API key**，已在 `.gitignore` 中忽略。不要把 `.chainrace/` 移出忽略列表，也不要提交它。
+> 想让 key 完全不落盘：`export TORN_API_KEY=...` 或加 `-no-save`。
 
 ### 3.2 非交互式
 
@@ -270,6 +273,18 @@ internal/chain/         时间分桶与累计聚合（纯函数，无网络依�
 internal/flourish/      Flourish 宽表 CSV 渲染
 internal/cli/           交互提示、配置持久化、流程编排
 ```
+
+### 9.1 配置文件位置
+
+```
+<当前工作目录>/.chainrace/config.json     ← API key、默认间隔/指标/输出目录
+<当前工作目录>/.chainrace-cache/          ← 原始 API 响应缓存
+<当前工作目录>/out/                       ← 生成的 CSV
+```
+
+三者都以**当前工作目录**为基准，跟着项目走。`.chainrace/` 与 `.chainrace-cache/`、`out/` 均已在 `.gitignore` 中忽略。
+
+删除 `.chainrace/config.json` 即可让工具下次重新询问 key，不会报错。
 
 ## 10. 测试
 
