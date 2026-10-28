@@ -76,6 +76,7 @@ jobs:
             out="dist/chainrace_${VERSION}_${os}_${arch}${ext}"
             echo "▸ $out"
             GOOS="$os" GOARCH="$arch" go build \
+              -buildvcs=false \
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o "$out" .
           done
