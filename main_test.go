@@ -15,6 +15,7 @@ func newTestFlagSet() *flag.FlagSet {
 		b1 bool
 		b2 bool
 		b3 bool
+		b4 bool
 	)
 	fs.StringVar(&s, "api", "", "")
 	fs.Int64Var(&n, "chain", 0, "")
@@ -22,6 +23,7 @@ func newTestFlagSet() *flag.FlagSet {
 	fs.BoolVar(&b1, "offline", false, "")
 	fs.BoolVar(&b2, "refresh", false, "")
 	fs.BoolVar(&b3, "yes", false, "")
+	fs.BoolVar(&b4, "dump-attacks", false, "")
 	return fs
 }
 
@@ -55,6 +57,11 @@ func TestReorderArgs(t *testing.T) {
 			name: "双横线写法",
 			in:   []string{"1234567", "--offline", "--chain", "42"},
 			want: []string{"--offline", "--chain", "42", "1234567"},
+		},
+		{
+			name: "布尔开关后面跟位置参数时不吃掉它",
+			in:   []string{"-dump-attacks", "1234567", "-offline"},
+			want: []string{"-dump-attacks", "-offline", "1234567"},
 		},
 		{
 			name: "显式 -- 之后全部按位置参数处理",

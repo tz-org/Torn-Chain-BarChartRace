@@ -20,6 +20,12 @@ import (
 // 因此必须带上可识别的自有标识。
 const DefaultUserAgent = "Torn-Chain-BarChartRace/1.0 (+https://github.com/tz-org/Torn-Chain-BarChartRace)"
 
+// DefaultComment 是随每次请求发送的标识，会出现在 Torn 的 API 使用日志里。
+//
+// 用途：把本工具的调用与其他脚本区分开，排查 429 或配额异常时能直接看出是谁在打。
+// 该字段展示长度有限（旧版文档称超过 10 个字符不显示），所以刻意保持简短。
+const DefaultComment = "Chain-BarChartRace"
+
 // 退避与重试参数。
 const (
 	// DefaultMaxAttempts 是单次请求的总尝试次数（含首次）。
@@ -45,6 +51,9 @@ type Options struct {
 	// APIKey 是 Torn API key。走 Authorization 头，不出现在 URL 里。
 	APIKey string
 
+	// Comment 是请求标识（写进 Torn 的 API 日志）。空表示用 DefaultComment。
+	Comment string
+
 	// Limiter 是限流器。nil 表示不限制（仅供测试）。
 	Limiter *Limiter
 
@@ -61,6 +70,7 @@ type Client struct {
 	baseURL     string
 	userAgent   string
 	apiKey      string
+	comment     string
 	limiter     *Limiter
 	maxAttempts int
 
@@ -117,12 +127,17 @@ func NewClient(opt Options) (*Client, error) {
 	if attempts <= 0 {
 		attempts = DefaultMaxAttempts
 	}
+	comment := strings.TrimSpace(opt.Comment)
+	if comment == "" {
+		comment = DefaultComment
+	}
 
 	return &Client{
 		http:        &http.Client{Timeout: timeout},
 		baseURL:     base,
 		userAgent:   ua,
 		apiKey:      strings.TrimSpace(opt.APIKey),
+		comment:     comment,
 		limiter:     opt.Limiter,
 		maxAttempts: attempts,
 		clock:       time.Now,
@@ -148,7 +163,13 @@ func (c *Client) GetFullURLRaw(ctx context.Context, fullURL string) (*Response, 
 	if err := c.checkSameOrigin(fullURL); err != nil {
 		return nil, err
 	}
-	return c.doEndpoint(ctx, fullURL)
+	// prev / next 是服务端给的字符串，里面没有 comment —— 跟随前补上，
+	// 否则翻页请求在 Torn 的 API 日志里就失去标识了。
+	withComment, err := addComment(fullURL, c.comment)
+	if err != nil {
+		return nil, err
+	}
+	return c.doEndpoint(ctx, withComment)
 }
 
 // checkSameOrigin 校验 rawURL 与 baseURL 同源（scheme + host 都相同）。
@@ -301,10 +322,44 @@ func (c *Client) buildURL(path string, query url.Values) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("拼接请求地址失败: %w", err)
 	}
-	if len(query) > 0 {
+	if q := withComment(query, c.comment); len(q) > 0 {
 		// url.Values.Encode 按 key 排序输出，保证同一组参数得到同一个 URL。
-		u.RawQuery = query.Encode()
+		u.RawQuery = q.Encode()
 	}
+	return u.String(), nil
+}
+
+// withComment 返回追加了 comment 的 query 副本。
+//
+// 复制而不是就地修改：调用方可能复用同一份 url.Values（例如同一查询条件
+// 反复构造请求），就地写入会让它的行为随调用次数变化。
+func withComment(query url.Values, comment string) url.Values {
+	if comment == "" {
+		return query
+	}
+	out := make(url.Values, len(query)+1)
+	for k, vs := range query {
+		out[k] = append([]string(nil), vs...)
+	}
+	out.Set("comment", comment)
+	return out
+}
+
+// addComment 给完整 URL 追加 comment（已有同名参数时覆盖）。
+func addComment(rawURL, comment string) (string, error) {
+	if comment == "" {
+		return rawURL, nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("torn: 待跟随的 URL 无法解析: %w", err)
+	}
+	q := u.Query()
+	if q.Get("comment") == comment {
+		return rawURL, nil
+	}
+	q.Set("comment", comment)
+	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
 

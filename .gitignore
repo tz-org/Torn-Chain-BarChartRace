@@ -32,6 +32,8 @@ out/
 .scratch/
 # 本地助手的工作区笔记，与项目源码无关。
 .workbuddy-ai/
+# WorkBuddy 的项目内记忆与本地状态，同样与项目源码无关。
+.workbuddy/
 *.tmp
 *.log
 

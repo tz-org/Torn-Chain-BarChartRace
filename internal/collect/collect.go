@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"Torn-Chain-BarChartRace/internal/torn"
@@ -53,6 +54,15 @@ func (c *Cache) attacksDir(chainID int64) string {
 
 func (c *Cache) attacksPagePath(chainID int64, page int) string {
 	return filepath.Join(c.attacksDir(chainID), fmt.Sprintf("page-%04d.json", page))
+}
+
+// attacksSlicePagePath 是分片并发布局下某一分片某一页的缓存路径。
+//
+// 文件名里带的是**种子时间戳**而不是分片序号：分片序号只在某一次分片方案内
+// 有意义，用户改过 -slices 之后同序号代表的时间区间完全不同。用序号命名会让
+// 「上一次跑到一半的 2 分片缓存」被「这一次的 4 分片」误读，拼出一份有缺口的数据。
+func (c *Cache) attacksSlicePagePath(chainID, seed int64, page int) string {
+	return filepath.Join(c.attacksDir(chainID), fmt.Sprintf("s%012d-p%04d.json", seed, page))
 }
 
 func (c *Cache) attacksManifestPath(chainID int64) string {
@@ -104,21 +114,98 @@ type attacksManifest struct {
 	Pages     int       `json:"pages"`
 	Complete  bool      `json:"complete"`
 	FetchedAt time.Time `json:"fetched_at"`
+
+	// Layout 为空表示旧版「单游标串行」布局（attacks/page-0001.json）。
+	// 为 "sliced" 时是分片并发布局（attacks/s0001-p0001.json）。
+	// 保留该字段是为了让旧缓存继续可读 —— 升级工具不该让已花掉的配额作废。
+	Layout string `json:"layout,omitempty"`
+	Slices int    `json:"slices,omitempty"`
+	// Seeds 是各分片的 to 上界，严格降序，首项等于主查询的 to。
+	Seeds []int64 `json:"seeds,omitempty"`
+	// SlicePages 是各分片实际落盘的页数，离线重放时用它发现缺页。
+	SlicePages []int `json:"slice_pages,omitempty"`
+}
+
+// 缓存布局标识。
+const (
+	layoutSerial = ""       // 旧版：单游标顺序翻页
+	layoutSliced = "sliced" // 分片并发：每个分片一条独立游标链
+)
+
+// 分片并发参数。
+const (
+	// maxSlices 是分片数上限。
+	//
+	// 上限取 4 而不是更大：实测单页 attacksfull 的 RTT 约 1.5s，
+	// 而限流器要求每次请求间隔 666ms（90/min）。要让配额跑满，
+	// 在途请求需要约 1.5s/666ms ≈ 2.3 个，4 个已足够覆盖抖动，
+	// 再多只会在限流器上排队，不会更快。
+	maxSlices = 4
+	// sliceWindowThreshold 是启用分片的最小时间窗。
+	//
+	// 窗口过短时（短链通常一页就取完）开分片反而更慢：
+	// 每多一个分片就多一次首屏请求，而它们仍受 666ms 的最小间隔约束。
+	sliceWindowThreshold = 2 * time.Hour
+)
+
+// slicesForWindow 按时间窗决定分片数。
+//
+// 判据刻意只依赖窗口长度而不看攻击密度：密度要抓过才知道，
+// 而抓过之后缓存已经就位，再改方案没有意义。
+// 代价是「长但稀疏」的 chain 会多发几个请求（每个约 666ms），
+// 换来的收益是「长且密集」的 chain 快一倍以上。
+func slicesForWindow(from, to int64) int {
+	if from <= 0 || to <= 0 || to <= from {
+		return 1
+	}
+	switch d := time.Duration(to-from) * time.Second; {
+	case d >= 8*time.Hour:
+		return maxSlices
+	case d >= sliceWindowThreshold:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// sliceSeeds 返回各分片的 to 上界：严格降序，首项 == to，末项仍高于 from。
+//
+// 分片 i 负责区间 (seeds[i+1], seeds[i]]（最后一片下界为 from）。
+// 相邻分片在边界上**重叠**而不是首尾相接：边界那条记录的 ended 可能等于种子值，
+// 服务端的 to 是闭区间，两个分片都会取到它 —— 由去重吸收，宁可重复也不能漏。
+func sliceSeeds(from, to int64, n int) []int64 {
+	if n <= 1 {
+		return []int64{to}
+	}
+	span := to - from
+	seeds := make([]int64, n)
+	for i := range seeds {
+		seeds[i] = to - span*int64(i)/int64(n)
+	}
+	return seeds
 }
 
 // Collector 把「网络 + 缓存」组合成单一的取数入口。
+//
+// 分片并发时会被多个 goroutine 同时调用，因此日志必须串行化：
+// 否则多个分片的进度行会互相插进对方中间，输出不可读。
 type Collector struct {
 	Client  *torn.Client
 	Cache   *Cache
 	Refresh bool // 忽略已有缓存，强制重新抓取
 	Offline bool // 只用缓存，绝不发请求
 	Log     func(format string, args ...any)
+
+	logMu sync.Mutex
 }
 
 func (c *Collector) logf(format string, args ...any) {
-	if c.Log != nil {
-		c.Log(format, args...)
+	if c.Log == nil {
+		return
 	}
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	c.Log(format, args...)
 }
 
 // ChainReport 取 chain 报告（优先缓存）。
@@ -183,6 +270,8 @@ func (c *Collector) Members(ctx context.Context, chainID, factionID int64) (map[
 type AttacksResult struct {
 	Attacks []torn.Attack
 	Pages   int
+	// Slices 是本次取数用的并行分片数；1 表示单游标顺序翻页。
+	Slices int
 	// FromCache 表示全部数据来自磁盘缓存（本次没有消耗配额）。
 	FromCache bool
 	// Partial 表示翻页没有走到底（撞上页数上限或缓存不完整）。
@@ -219,9 +308,13 @@ type AttacksOptions struct {
 	//
 	// 用「整页最新」而不是「整页最老」作为判据，是因为游标语义下页内顺序不保证
 	// 严格按 started 单调 —— 以「最老」为准可能在窗口内还有数据时提前收手。
+	// 仅在顺序翻页时使用；分片模式改用「本片下界」判断。
 	StopWhenPageOlderThan int64
 	// MaxPages 是页数上限，防止异常情况把配额打空。
 	MaxPages int
+	// Slices 覆盖自动分片数：0 表示按窗口长度自动决定，1 表示强制串行。
+	// 大于 maxSlices 时按 maxSlices 处理 —— 再多的并发只会在限流器上排队。
+	Slices int
 }
 
 // DefaultMaxPages 是翻页上限。limit=1000 时 200 页 = 20 万条，
@@ -270,29 +363,61 @@ func (c *Collector) cachedManifest(chainID int64, want attacksManifest) (attacks
 }
 
 // attacksFromCache 完全离线地读回已落盘的分页。
+//
+// 支持两种布局：旧版单游标（page-N）与分片并发（sN-pM）。
+// 布局必须由清单里的 Layout 决定，不能靠「文件在不在」去猜 ——
+// 猜错会静默地只读回一部分数据，而图表看起来毫无异常。
 func (c *Collector) attacksFromCache(opt AttacksOptions, manifest attacksManifest) (*AttacksResult, error) {
 	got, ok := c.cachedManifest(opt.ChainID, manifest)
 	if !ok {
 		return nil, fmt.Errorf("离线模式下没有可用的攻击记录缓存（%s）", c.Cache.attacksDir(opt.ChainID))
 	}
 
-	res := &AttacksResult{FromCache: true, Partial: !got.Complete}
+	res := &AttacksResult{FromCache: true, Partial: !got.Complete, Slices: max(got.Slices, 1)}
 	seen := make(map[int64]struct{}, 1024)
-	for page := 1; page <= got.Pages; page++ {
-		raw, ok := c.Cache.Read(c.Cache.attacksPagePath(opt.ChainID, page))
-		if !ok {
-			res.Warnings = append(res.Warnings,
-				fmt.Sprintf("缓存缺少第 %d 页（共 %d 页），数据不完整", page, got.Pages))
-			res.Partial = true
-			continue
+
+	if got.Layout == layoutSliced {
+		if got.Slices <= 0 || len(got.SlicePages) != got.Slices || len(got.Seeds) != got.Slices {
+			return nil, fmt.Errorf(
+				"攻击记录缓存清单与本版本不兼容（slices=%d，页数=%d 项，种子=%d 项），请去掉 -offline 重新抓取",
+				got.Slices, len(got.SlicePages), len(got.Seeds))
 		}
-		parsed, err := torn.DecodeAttacksPage(raw)
-		if err != nil {
-			return nil, fmt.Errorf("解析缓存第 %d 页失败: %w", page, err)
+		for slice := 0; slice < got.Slices; slice++ {
+			for page := 1; page <= got.SlicePages[slice]; page++ {
+				raw, ok := c.Cache.Read(c.Cache.attacksSlicePagePath(opt.ChainID, got.Seeds[slice], page))
+				if !ok {
+					res.Warnings = append(res.Warnings, fmt.Sprintf(
+						"缓存缺少分片 %d/%d 的第 %d 页（共 %d 页），数据不完整",
+						slice+1, got.Slices, page, got.SlicePages[slice]))
+					res.Partial = true
+					continue
+				}
+				parsed, err := torn.DecodeAttacksPage(raw)
+				if err != nil {
+					return nil, fmt.Errorf("解析缓存（分片 %d 第 %d 页）失败: %w", slice+1, page, err)
+				}
+				mergeAttacks(res, parsed, seen)
+				res.Pages++
+			}
 		}
-		mergeAttacks(res, parsed, seen)
-		res.Pages++
+	} else {
+		for page := 1; page <= got.Pages; page++ {
+			raw, ok := c.Cache.Read(c.Cache.attacksPagePath(opt.ChainID, page))
+			if !ok {
+				res.Warnings = append(res.Warnings,
+					fmt.Sprintf("缓存缺少第 %d 页（共 %d 页），数据不完整", page, got.Pages))
+				res.Partial = true
+				continue
+			}
+			parsed, err := torn.DecodeAttacksPage(raw)
+			if err != nil {
+				return nil, fmt.Errorf("解析缓存第 %d 页失败: %w", page, err)
+			}
+			mergeAttacks(res, parsed, seen)
+			res.Pages++
+		}
 	}
+
 	if !got.Complete {
 		res.Warnings = append(res.Warnings,
 			"缓存标记为「未抓完」，数据可能不完整；建议去掉 --offline 重新抓取")
@@ -301,11 +426,8 @@ func (c *Collector) attacksFromCache(opt AttacksOptions, manifest attacksManifes
 	return res, nil
 }
 
-// attacksFromNetwork 在线翻页，并顺带把每页原始响应落盘。
+// attacksFromNetwork 在线取数：先看缓存，再决定用串行还是分片并发。
 func (c *Collector) attacksFromNetwork(ctx context.Context, opt AttacksOptions, manifest attacksManifest) (*AttacksResult, error) {
-	res := &AttacksResult{}
-	seen := make(map[int64]struct{}, 1024)
-
 	// 先看缓存是否已经完整抓过同一查询条件 —— 命中则零配额返回。
 	if !c.Refresh {
 		if got, ok := c.cachedManifest(opt.ChainID, manifest); ok && got.Complete {
@@ -315,6 +437,21 @@ func (c *Collector) attacksFromNetwork(ctx context.Context, opt AttacksOptions, 
 			}
 		}
 	}
+
+	n := slicesForWindow(opt.Query.From, opt.Query.To)
+	if opt.Slices > 0 {
+		n = min(opt.Slices, maxSlices)
+	}
+	if n > 1 {
+		return c.fetchSliced(ctx, opt, manifest, n)
+	}
+	return c.fetchSerial(ctx, opt, manifest)
+}
+
+// fetchSerial 是单游标顺序翻页，也是旧缓存的布局。
+func (c *Collector) fetchSerial(ctx context.Context, opt AttacksOptions, manifest attacksManifest) (*AttacksResult, error) {
+	res := &AttacksResult{Slices: 1}
+	seen := make(map[int64]struct{}, 1024)
 
 	var prevURL string
 	for page := 1; page <= opt.MaxPages; page++ {
@@ -373,12 +510,16 @@ func (c *Collector) attacksFromNetwork(ctx context.Context, opt AttacksOptions, 
 			break
 		}
 
-		// ⚠️ 原样使用服务端给的 prev 链接，**不要自行改写其中的 to**。
+		// ⚠️ 原样使用服务端给的 prev 链接，**不要改写其中的 to**。
 		//
 		// 曾经尝试过「把 to 再往前推 60 秒以制造更大重叠」，实测反而更糟：
 		// 同一条 chain 从 101,399 条掉到 97,415 条（少 4,000 条）。
 		// 说明 to 不是纯粹的「时间上界」，而是一个内部游标 ——
-		// 改动它会整体平移游标，把整整一页的数据跳过去。
+		// 在已有游标链上平移它会整体跳页。
+		//
+		// 分片并发里的 to 是**新建**一条游标链的起点，性质不同：
+		// 已用本地 102 页完整数据逐 id 验证过，种子 to 取任意时刻都能精确
+		// 复现「ended <= to 的最新 1000 条」。
 		prevURL = parsed.PrevLink
 	}
 
@@ -390,14 +531,174 @@ func (c *Collector) attacksFromNetwork(ctx context.Context, opt AttacksOptions, 
 	}
 
 	manifest.FetchedAt = time.Now()
-	if raw, err := json.MarshalIndent(manifest, "", "  "); err == nil {
-		if werr := c.Cache.Write(c.Cache.attacksManifestPath(opt.ChainID), raw); werr != nil {
-			c.logf("⚠️ 写入缓存清单失败：%v", werr)
-		}
-	}
+	c.writeManifest(opt.ChainID, manifest)
 
 	sortAttacks(res.Attacks)
 	return res, nil
+}
+
+// sliceResult 是单个分片的取数结果。
+type sliceResult struct {
+	attacks  []torn.Attack
+	pages    int
+	partial  bool
+	warnings []string
+	err      error
+}
+
+// fetchSliced 把时间窗切成 n 段，每段一条独立游标链，并发取数。
+//
+// 为什么能并行：服务端每页由 `to`（= 上一页最小 ended）唯一确定，
+// 因此「在窗口中间新建一条游标链」与「顺着 prev 翻到那里」的结果相同。
+// 已用完整缓存逐 id 验证（见 README 7.5）。
+//
+// 各分片只负责自己的闭区间，边界记录会被相邻分片重复取到，由去重吸收 ——
+// 宁可多取一条，也不能在边界上留缝。
+func (c *Collector) fetchSliced(ctx context.Context, opt AttacksOptions, manifest attacksManifest, n int) (*AttacksResult, error) {
+	seeds := sliceSeeds(opt.Query.From, opt.Query.To, n)
+	// 页数上限按分片均摊，避免异常情况下把配额打空。
+	perSliceCap := opt.MaxPages/n + 2
+
+	out := make([]sliceResult, n)
+
+	// 一个分片失败就取消其余分片：继续取只会白烧配额。
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			lower := opt.Query.From
+			if i+1 < n {
+				lower = seeds[i+1]
+			}
+			r := c.fetchSlice(runCtx, opt, i, n, seeds[i], lower, perSliceCap)
+			out[i] = r
+			if r.err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = r.err
+				}
+				errMu.Unlock()
+				cancel()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	res := &AttacksResult{Slices: n}
+	seen := make(map[int64]struct{}, 1024)
+	manifest.Layout = layoutSliced
+	manifest.Slices = n
+	manifest.Seeds = seeds
+	manifest.SlicePages = make([]int, n)
+	manifest.Complete = true
+
+	for i := range out {
+		mergeAttackList(res, out[i].attacks, seen)
+		manifest.SlicePages[i] = out[i].pages
+		res.Pages += out[i].pages
+		if out[i].partial {
+			manifest.Complete = false
+			res.Partial = true
+		}
+		res.Warnings = append(res.Warnings, out[i].warnings...)
+	}
+	manifest.Pages = res.Pages
+	manifest.FetchedAt = time.Now()
+
+	c.logf("分片并发：%d 路并行 / 共 %d 页 / 去重后 %d 条", n, res.Pages, len(res.Attacks))
+	c.writeManifest(opt.ChainID, manifest)
+
+	sortAttacks(res.Attacks)
+	return res, nil
+}
+
+// fetchSlice 取第 idx 个分片：从 to=upper 起顺着 prev 翻到 lower 以下为止。
+func (c *Collector) fetchSlice(ctx context.Context, opt AttacksOptions, idx, total int, upper, lower int64,
+	maxPages int,
+) sliceResult {
+	var out sliceResult
+	q := opt.Query
+	q.To = upper
+
+	var prevURL string
+	for page := 1; page <= maxPages; page++ {
+		var (
+			parsed   *torn.AttacksPage
+			raw      []byte
+			err      error
+			fromDisk bool
+		)
+
+		path := c.Cache.attacksSlicePagePath(opt.ChainID, upper, page)
+		if !c.Refresh {
+			if b, ok := c.Cache.Read(path); ok {
+				if p, derr := torn.DecodeAttacksPage(b); derr == nil {
+					parsed, raw, fromDisk = p, b, true
+				}
+			}
+		}
+		if parsed == nil {
+			if prevURL != "" {
+				parsed, raw, err = c.Client.AttacksPageByURL(ctx, prevURL)
+			} else {
+				parsed, raw, err = c.Client.AttacksFirstPage(ctx, q)
+			}
+			if err != nil {
+				out.err = fmt.Errorf("抓取第 %d/%d 分片第 %d 页失败: %w", idx+1, total, page, err)
+				return out
+			}
+			if werr := c.Cache.Write(path, raw); werr != nil {
+				c.logf("⚠️ 写入分片 %d/%d 第 %d 页缓存失败：%v", idx+1, total, page, werr)
+			}
+		} else {
+			c.logf("分片 %d/%d · 第 %d 页：命中缓存", idx+1, total, page)
+		}
+
+		out.attacks = append(out.attacks, parsed.Attacks...)
+		out.pages = page
+		c.logf("分片 %d/%d · 第 %d 页：%d 条（本片累计 %d 条）%s",
+			idx+1, total, page, len(parsed.Attacks), len(out.attacks), mark(fromDisk))
+
+		// 本片已取完：空页，或服务端没有更早的页了。
+		if len(parsed.Attacks) == 0 || !parsed.HasPrev {
+			return out
+		}
+		// 本片已跨过自己的下界：再往后翻只会在下一片的区间里重复。
+		// 用 <= 而不是 <：边界那条记录的 ended 恰好等于 lower 时，
+		// 下一片（to=lower，闭区间）同样会取到它，不会因此留缝。
+		if lower > 0 && oldestEnded(parsed.Attacks) <= lower {
+			return out
+		}
+
+		prevURL = parsed.PrevLink
+	}
+
+	out.partial = true
+	out.warnings = append(out.warnings, fmt.Sprintf(
+		"第 %d/%d 分片达到页数上限 %d 仍未取完，数据可能不完整", idx+1, total, maxPages))
+	return out
+}
+
+// writeManifest 落盘缓存清单；失败只记日志，不影响已经取到的数据。
+func (c *Collector) writeManifest(chainID int64, manifest attacksManifest) {
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return
+	}
+	if werr := c.Cache.Write(c.Cache.attacksManifestPath(chainID), raw); werr != nil {
+		c.logf("⚠️ 写入缓存清单失败：%v", werr)
+	}
 }
 
 func mark(fromDisk bool) string {
@@ -412,13 +713,36 @@ func mark(fromDisk bool) string {
 // 跨页重复是服务端分页边界的正常现象（同一秒的多条攻击可能被切在两页），
 // 去重是必需的，否则累计值会虚高。
 func mergeAttacks(res *AttacksResult, page *torn.AttacksPage, seen map[int64]struct{}) {
-	for _, a := range page.Attacks {
+	mergeAttackList(res, page.Attacks, seen)
+}
+
+// mergeAttackList 把一批攻击并入结果，按 id 去重（分片结果按片合并时复用）。
+func mergeAttackList(res *AttacksResult, attacks []torn.Attack, seen map[int64]struct{}) {
+	for _, a := range attacks {
 		if _, dup := seen[a.ID]; dup {
 			continue
 		}
 		seen[a.ID] = struct{}{}
 		res.Attacks = append(res.Attacks, a)
 	}
+}
+
+// oldestEnded 返回一页里最早的结束时间戳；ended 缺失时回退到 started。
+//
+// 用 ended 而不是 started 作分片边界：服务端游标的 to 就等于当页最小 ended
+// （实测 page-0001 的 prev.to 与 min(ended) 完全相等），跟随同一个口径才不会错位。
+func oldestEnded(attacks []torn.Attack) int64 {
+	var oldest int64
+	for _, a := range attacks {
+		t := a.Ended
+		if t.IsZero() || t.Before(a.Started) {
+			t = a.Started
+		}
+		if ts := t.Unix(); oldest == 0 || ts < oldest {
+			oldest = ts
+		}
+	}
+	return oldest
 }
 
 // newestStarted 返回一页里最晚的开始时间戳；空页返回 0。

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"Torn-Chain-BarChartRace/internal/attacklog"
 	"Torn-Chain-BarChartRace/internal/chain"
 	"Torn-Chain-BarChartRace/internal/collect"
 	"Torn-Chain-BarChartRace/internal/flourish"
@@ -33,7 +34,11 @@ type Options struct {
 	ResolveNames bool
 	RateLimit    int // 每分钟请求上限
 	NoSave       bool
-	AssumeYes    bool
+	// DumpAttacks 为真时额外导出窗口内逐条攻击记录，供核对与留档。
+	DumpAttacks bool
+	// Slices 覆盖并发取数分片数：0 自动，1 强制串行。
+	Slices    int
+	AssumeYes bool
 }
 
 // Defaults 是各参数的默认值。
@@ -188,6 +193,7 @@ func Run(ctx context.Context, opt Options, in io.Reader, out io.Writer) error {
 			To:      end.Add(collect.QueryMargin).Unix(),
 		},
 		StopWhenPageOlderThan: start.Unix(),
+		Slices:                opt.Slices,
 	})
 	if err != nil {
 		return decorate(err)
@@ -277,8 +283,46 @@ func Run(ctx context.Context, opt Options, in io.Reader, out io.Writer) error {
 		fmt.Fprintf(out, "  ✓ %s（%d 行，逐人明细）\n", valPath, len(val.Rows))
 	}
 
+	// ── 11. 逐条攻击记录（可选） ───────────────────────────────────
+	if opt.DumpAttacks {
+		path := filepath.Join(outDir, fmt.Sprintf("chain-%d-attacks.csv", chainID))
+		st, derr := attacklog.WriteFile(path, attacks.Attacks, attacklog.Options{
+			Start:     start,
+			End:       end,
+			FactionID: report.FactionID,
+			Names:     names,
+		})
+		if derr != nil {
+			fmt.Fprintf(out, "  ⚠️ 写出攻击记录失败：%v\n", derr)
+		} else {
+			written = append(written, path)
+			printAttackLogSummary(out, path, st, baseResult)
+		}
+	}
+
 	printFinalSummary(out, report, baseResult, attacks, interval, limiter, written)
 	return nil
+}
+
+// printAttackLogSummary 报告导出结果，并与汇总口径交叉核对。
+//
+// 核对是刻意的：导出与聚合用的是同一条筛选规则（窗口相交 + 本帮派），
+// 一旦两处逻辑漂移，数字就会对不上 —— 而这种漂移在图表上完全看不出来。
+func printAttackLogSummary(out io.Writer, path string, st attacklog.Stats, base chain.Result) {
+	dup := ""
+	if st.Duplicates > 0 {
+		dup = fmt.Sprintf("，剔除跨页重复 %d 条", st.Duplicates)
+	}
+	fmt.Fprintf(out, "  ✓ %s（%s 条窗口内攻击%s；其中计入统计 %s 条 / %s respect）\n",
+		path, commas(int64(st.Rows)), dup, commas(int64(st.Counted)), money(st.CountedRespect))
+
+	if st.Rows != base.TotalEvents || st.Counted != base.TotalHits ||
+		math.Abs(st.CountedRespect-base.TotalRespect) > chain.RespectTolerance {
+		fmt.Fprintf(out, "  ⚠️ 攻击记录与统计口径不一致（行 %d/%d · 计入 %d/%d · respect %s/%s），"+
+			"请附 chain id 反馈\n",
+			st.Rows, base.TotalEvents, st.Counted, base.TotalHits,
+			money(st.CountedRespect), money(base.TotalRespect))
+	}
 }
 
 // applyConfigDefaults 用配置文件里的值填补未显式指定的参数。
@@ -694,8 +738,12 @@ func printFinalSummary(out io.Writer, r *torn.ChainReport, res chain.Result,
 		commas(int64(res.TotalEvents)), commas(int64(res.TotalHits)))
 	fmt.Fprintf(out, " 成功攻击的 respect 合计 %s（官方口径 %s）\n",
 		money(res.TotalRespect), money(r.Respect))
-	fmt.Fprintf(out, " 时间分桶：%s × %d 列 · 参与者 %d 人 · 攻击分页 %d 页\n",
-		interval, len(res.Columns), len(res.Series), attacks.Pages)
+	sliced := ""
+	if attacks.Slices > 1 {
+		sliced = fmt.Sprintf("（%d 路并发分片）", attacks.Slices)
+	}
+	fmt.Fprintf(out, " 时间分桶：%s × %d 列 · 参与者 %d 人 · 攻击分页 %d 页%s\n",
+		interval, len(res.Columns), len(res.Series), attacks.Pages, sliced)
 
 	if len(res.Series) > 0 {
 		fmt.Fprintf(out, "\n Top 10（%s）：\n", res.Metric)

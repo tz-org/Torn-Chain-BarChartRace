@@ -52,6 +52,8 @@ func run() error {
 		resolveNames bool
 		rateLimit    int
 		noSave       bool
+		dumpAttacks  bool
+		slices       int
 		yes          bool
 		showVersion  bool
 	)
@@ -68,6 +70,8 @@ func run() error {
 	flag.BoolVar(&resolveNames, "resolve-names", true, "成员名单里查不到时逐个查询用户名")
 	flag.IntVar(&rateLimit, "rate", 0, "每分钟请求上限（默认 90，Torn 官方上限 100）")
 	flag.BoolVar(&noSave, "no-save", false, "不把 API key 写入配置文件")
+	flag.BoolVar(&dumpAttacks, "dump-attacks", false, "额外导出窗口内全部去重后的攻击记录 CSV")
+	flag.IntVar(&slices, "slices", 0, "并发取数分片数：0=按窗口自动，1=顺序翻页")
 	flag.BoolVar(&yes, "yes", false, "不做任何交互（缺参数则直接报错）")
 	flag.BoolVar(&showVersion, "version", false, "打印版本号后退出")
 
@@ -117,6 +121,8 @@ func run() error {
 		ResolveNames: resolveNames,
 		RateLimit:    rateLimit,
 		NoSave:       noSave,
+		DumpAttacks:  dumpAttacks,
+		Slices:       slices,
 		AssumeYes:    yes,
 	}
 	return cli.Run(ctx, opt, os.Stdin, os.Stdout)
@@ -181,6 +187,7 @@ func usage() {
   chainrace -chain 1234567 -interval 10m   10 分钟一桶
   chainrace -chain 1234567 -metric respect 只出 respect 口径
   chainrace -chain 1234567 -offline        用本地缓存重算，零配额
+  chainrace -chain 1234567 -dump-attacks  额外导出逐条攻击记录
 
 选项：
 `, version)
@@ -192,5 +199,6 @@ func usage() {
 输出：
   out/chain-<id>-respect.csv  累计 respect（宽表：首列 Name，其余每列一个时间阶段）
   out/chain-<id>-hits.csv     累计连击命中数
+  out/chain-<id>-attacks.csv  窗口内逐条攻击记录（仅 -dump-attacks 时生成）
 `)
 }
