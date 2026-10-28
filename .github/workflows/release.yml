@@ -1,0 +1,118 @@
+name: Release
+
+# 推送 v* tag 即自动构建并发布 Release。
+# 版本号取自 tag 名（去掉前缀 v），注入到 main.version。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 允许对已存在的 tag 手工重跑，用于补传产物或修版。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v0.0.1），必须已存在'
+        required: true
+        type: string
+
+# GITHUB_TOKEN 默认只读，创建 Release 与上传资产需要写权限。
+permissions:
+  contents: write
+
+# 同一 tag 的并发运行串行化，避免两个 job 同时抢建同一个 Release。
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GOFLAGS: -trimpath
+  CGO_ENABLED: 0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          # --generate-notes 需要完整历史来算「上个 tag 之后有哪些提交」。
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 解析版本号
+        id: ver
+        # push 事件用 ref_name（即 tag 名）；手工触发用 inputs.tag。
+        run: |
+          set -euo pipefail
+          ref="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          if [ -z "$ref" ]; then
+            echo "::error::无法确定 tag 名"
+            exit 1
+          fi
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          echo "发布版本：${ref#v}（tag $ref）"
+
+      - name: 单元测试
+        # 测试不过就不该产出 Release —— 把失败挡在发布之前。
+        run: go test ./...
+
+      - name: 交叉编译
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # os/arch 列表；需要新增平台时只改这一行。
+          for target in windows/amd64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            out="dist/chainrace_${VERSION}_${os}_${arch}${ext}"
+            echo "▸ $out"
+            GOOS="$os" GOARCH="$arch" go build \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "$out" .
+          done
+          ls -l dist
+
+      - name: 生成校验和
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum chainrace_* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 幂等：Release 已存在（重跑 / force-push tag）则覆盖资产，而不是报错。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传资产"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --verify-tag \
+              --generate-notes
+          fi
+
+      - name: 汇总
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          {
+            echo "### Release $TAG"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

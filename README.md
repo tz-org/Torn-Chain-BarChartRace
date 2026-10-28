@@ -28,7 +28,21 @@
 > key 所属账号必须**在该帮派内**。`/faction/attacksfull` 只返回「自己帮派」的攻击，
 > 拿别帮的 key 去查这条 chain 会得到 0 条记录。
 
-## 2. 构建
+## 2. 安装
+
+### 2.1 下载预编译二进制（推荐）
+
+从 [Releases](../../releases/latest) 下载对应平台的产物，解压后直接运行：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows x64 | `chainrace_<version>_windows_amd64.exe` |
+| Linux x64 / arm64 | `chainrace_<version>_linux_amd64` / `_arm64` |
+| macOS Intel / Apple Silicon | `chainrace_<version>_darwin_amd64` / `_arm64` |
+
+每个 Release 附带 `SHA256SUMS.txt`，可用 `sha256sum -c SHA256SUMS.txt` 校验完整性。
+
+### 2.2 从源码构建
 
 ```bash
 git clone git@github.com:tz-org/Torn-Chain-BarChartRace.git
@@ -292,4 +306,24 @@ internal/cli/           交互提示、配置持久化、流程编排
 go test ./...
 ```
 
-分桶口径与 CSV 输出都有单元测试覆盖（`internal/chain`、`internal/flourish`）。
+分桶口径与 CSV 输出都有单元测试覆盖（`internal/chain`、`internal/flourish`），
+命令行参数重排有 `main_test.go` 覆盖。
+
+## 11. 发布
+
+发布由 GitHub Actions 自动完成，见 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
+
+```bash
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+推送 `v*` tag 后流水线会依次执行：
+
+1. `go test ./...` —— 测试不过则终止，不产出 Release；
+2. 交叉编译 5 个平台（windows/linux/darwin × amd64/arm64），版本号从 tag 名注入；
+3. 生成 `SHA256SUMS.txt`；
+4. 用 `GITHUB_TOKEN` 创建 Release 并上传全部产物，Release notes 由 `--generate-notes` 依据提交历史自动生成。
+
+对已存在的 tag 需要重跑时，可在 Actions 页面用 **Run workflow** 手工触发并填入 tag 名；
+若 Release 已存在，会走 `gh release upload --clobber` 覆盖资产而不是报错。
